@@ -736,7 +736,9 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
                     Array.from(oldFingerprints).some((x) => !newFingerprints.has(x)) ||
                     Array.from(newFingerprints).some((x) => !oldFingerprints.has(x));
                 if (candidateUpdates) {
-                    logger.debug(`Member(s) have updated/reconnected: re-sending keys`);
+                    logger.debug(
+                        `Member(s) have updated/reconnected: re-sending keys ${JSON.stringify(Array.from(oldFingerprints).sort())} vs ${JSON.stringify(Array.from(newFingerprints).sort())}`,
+                    );
                     this.requestKeyEventSend();
                 }
             } else {
