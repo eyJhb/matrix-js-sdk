@@ -14,11 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import { logger } from "../logger";
+import { logger as rootLogger } from "../logger";
 import { TypedEventEmitter } from "../models/typed-event-emitter";
 import { EventTimeline } from "../models/event-timeline";
 import { Room } from "../models/room";
-import { MatrixClient } from "../client";
+import { MatrixClient, SendToDeviceContentMap } from "../client";
 import { EventType } from "../@types/event";
 import { UpdateDelayedEventAction } from "../@types/requests";
 import {
@@ -38,6 +38,9 @@ import { MatrixError } from "../http-api/errors";
 import { MatrixEvent } from "../models/event";
 import { isLivekitFocusActive } from "./LivekitFocus";
 import { ExperimentalGroupCallRoomMemberState } from "../webrtc/groupCall";
+import { ToDeviceBatch, ToDeviceMessage } from "../models/ToDeviceMessage";
+
+const logger = rootLogger.getChild("MatrixRTCSession");
 
 const MEMBERSHIP_EXPIRY_TIME = 60 * 60 * 1000;
 const MEMBER_EVENT_CHECK_PERIOD = 2 * 60 * 1000; // How often we check to see if we need to re-send our member event
@@ -522,8 +525,6 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
         }
         this.lastEncryptionKeyUpdateRequest = Date.now();
 
-        logger.info("Sending encryption keys event");
-
         if (!this.isJoined()) return;
 
         const userId = this.client.getUserId();
@@ -540,16 +541,10 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
         }
 
         try {
-            await this.client.sendEvent(this.room.roomId, EventType.CallEncryptionKeysPrefix, {
-                keys: myKeys.map((key, index) => {
-                    return {
-                        index,
-                        key: encodeUnpaddedBase64(key),
-                    };
-                }),
-                device_id: deviceId,
-                call_id: "",
-            } as EncryptionKeysEventContent);
+            await Promise.allSettled([
+                this.sendKeysViaRoomEvent(deviceId, myKeys),
+                this.sendKeysViaToDevice(deviceId, myKeys),
+            ]);
 
             logger.debug(
                 `Embedded-E2EE-LOG updateEncryptionKeyEvent participantId=${userId}:${deviceId} numSent=${myKeys.length}`,
@@ -571,6 +566,71 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
             }
         }
     };
+
+    private async sendKeysViaRoomEvent(deviceId: string, myKeys: Uint8Array[]): Promise<void> {
+        const membersRequiringRoomEvent = this.memberships.filter(
+            (m) => !this.isMyMembership(m) && m.keyDistributionMethod === "room_event",
+        );
+
+        if (membersRequiringRoomEvent.length === 0) {
+            logger.info("No members require keys via room event");
+            return;
+        }
+
+        logger.info(
+            `Sending encryption keys event for: ${membersRequiringRoomEvent.map((m) => `${m.sender}:${m.deviceId}`).join(", ")}`,
+        );
+
+        await this.client.sendEvent(this.room.roomId, EventType.CallEncryptionKeysPrefix, {
+            keys: myKeys.map((key, index) => {
+                return {
+                    index,
+                    key: encodeUnpaddedBase64(key),
+                };
+            }),
+            device_id: deviceId,
+            call_id: "",
+        } as EncryptionKeysEventContent);
+    }
+
+    private async sendKeysViaToDevice(deviceId: string, myKeys: Uint8Array[]): Promise<void> {
+        const membershipsRequiringToDevice = this.memberships.filter(
+            (m) => !this.isMyMembership(m) && m.sender && m.keyDistributionMethod === "to_device",
+        );
+
+        if (membershipsRequiringToDevice.length === 0) {
+            logger.info("No members require keys via to-device event");
+            return;
+        }
+
+        const payload: EncryptionKeysEventContent = {
+            keys: myKeys.map((key, index) => {
+                return {
+                    index,
+                    key: encodeUnpaddedBase64(key),
+                };
+            }),
+            device_id: deviceId,
+            call_id: "",
+            room_id: this.room.roomId,
+        };
+
+        const toDeviceBatch: ToDeviceMessage[] = membershipsRequiringToDevice.map(({ deviceId, sender }) => ({
+            deviceId,
+            userId: sender!,
+            payload,
+        }));
+
+        logger.info(
+            `Sending encryption keys to-device batch for: ${toDeviceBatch.map(({ userId, deviceId }) => `${userId}:${deviceId}`).join(", ")}`,
+        );
+
+        // TODO: encrypt the events
+        await this.client.queueToDevice({
+            eventType: EventType.CallEncryptionKeysPrefix,
+            batch: toDeviceBatch,
+        });
+    }
 
     /**
      * Sets a timer for the soonest membership expiry
@@ -778,6 +838,7 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
             foci_active: this.ownFociPreferred,
             membershipID: this.membershipId,
             ...(createdTs ? { created_ts: createdTs } : {}),
+            key_distribution: "to_device",
         };
     }
     /**
@@ -791,6 +852,7 @@ export class MatrixRTCSession extends TypedEventEmitter<MatrixRTCSessionEvent, M
             device_id: deviceId,
             focus_active: { type: "livekit", focus_selection: "oldest_membership" },
             foci_preferred: this.ownFociPreferred ?? [],
+            key_distribution: "to_device",
         };
     }
 
