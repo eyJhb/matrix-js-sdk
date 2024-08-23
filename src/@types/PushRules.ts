@@ -54,10 +54,10 @@ export type MemberCountCondition<N extends number, Op extends ConditionOperator 
 
 export type AnyMemberCountCondition = MemberCountCondition<number, ConditionOperator>;
 
-export const DMMemberCountCondition: MemberCountCondition<2> = "2";
+export const DMMemberCountCondition: MemberCountCondition<3, ConditionOperator.LessThanOrEqual> = "<=3";
 
 export function isDmMemberCountCondition(condition: AnyMemberCountCondition): boolean {
-    return condition === "==2" || condition === "2";
+    return condition === "<=3";
 }
 
 export enum ConditionKind {
